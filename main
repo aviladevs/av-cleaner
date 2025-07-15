@@ -8,6 +8,8 @@ from datetime import datetime
 import psutil
 from pathlib import Path
 import threading
+from date_monitor import detectar_datas_relevantes
+import tkinter.messagebox as mbox
 
 # --- Configurações ---
 CONFIG_PATH = Path(__file__).parent.parent / "configs" / "settings.json"
@@ -163,6 +165,22 @@ class App(ctk.CTk):
         self.tab_clean = tabview.add("Limpeza")
         self.create_clean_tab()
 
+        # TAB de Datas
+        tab_datas = tabview.add("Datas")
+        cols = ("Tipo", "Arquivo", "Criado em", "Modificado em")
+        self.tree_datas = ttk.Treeview(tab_datas, columns=cols, show="headings")
+        for c in cols:
+            self.tree_datas.heading(c, text=c)
+            self.tree_datas.column(c, width=150)
+        self.tree_datas.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        btn_frame = CTkFrame(tab_datas)
+        btn_frame.pack(fill="x", pady=(0,10))
+        self.btn_update_datas = CTkButton(btn_frame, text="Atualizar Análise", command=self.update_datas)
+        self.btn_update_datas.pack(side="left", padx=5)
+        self.btn_summary = CTkButton(btn_frame, text="Resumo", command=self.show_datas_summary)
+        self.btn_summary.pack(side="left", padx=5)
+
         # Aba Processos
         self.tab_process = tabview.add("Processos")
         self.create_process_tab()
@@ -244,7 +262,17 @@ class App(ctk.CTk):
         self.btn_kill_proc.pack(side="left", padx=5)
 
         self.update_process_list()
-
+def update_datas(self):
+    pasta = self.selected_folder  # ou read-only config do app
+    avisos = detectar_datas_relevantes(pasta)
+    self.tree_datas.delete(*self.tree_datas.get_children())
+    for a in avisos:
+        self.tree_datas.insert("", "end", values=(
+            a["tipo"], a["nome"],
+            a["criado"].strftime("%Y-%m-%d"),
+            a["modificado"].strftime("%Y-%m-%d")
+        ))
+    mbox.showinfo("Datas Atualizadas", f"{len(avisos)} arquivos analisados.")
     def create_logs_tab(self):
         frame = self.tab_logs
 
@@ -262,6 +290,30 @@ class App(ctk.CTk):
         self.btn_refresh_logs.pack()
 
         self.load_logs()
+def update_datas(self):
+    pasta = self.selected_folder  # ou read-only config do app
+    avisos = detectar_datas_relevantes(pasta)
+    self.tree_datas.delete(*self.tree_datas.get_children())
+    for a in avisos:
+        self.tree_datas.insert("", "end", values=(
+            a["tipo"], a["nome"],
+            a["criado"].strftime("%Y-%m-%d"),
+            a["modificado"].strftime("%Y-%m-%d")
+        ))
+    mbox.showinfo("Datas Atualizadas", f"{len(avisos)} arquivos analisados.")
+
+def show_datas_summary(self):
+    pasta = self.selected_folder
+    avisos = detectar_datas_relevantes(pasta)
+    if not avisos:
+        mbox.showinfo("Resumo de Datas", "Nenhum aviso encontrado.")
+        return
+    msg = "📋 Avisos de arquivos:\n\n"
+    for a in avisos[:5]:
+        msg += f"{a['tipo']} — {a['nome']}\nCriado: {a['criado']} | Modificado: {a['modificado']}\n\n"
+    if len(avisos) > 5:
+        msg += f"... e mais {len(avisos) - 5} arquivos."
+    mbox.showinfo("Resumo de Datas", msg)
 
     # Ações
     def select_dir(self):
