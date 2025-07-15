@@ -1,0 +1,433 @@
+import os
+import json
+import shutil
+import customtkinter as ctk
+from tkinter import filedialog, messagebox, ttk
+import tkinter as tk
+from datetime import datetime
+import psutil
+from pathlib import Path
+import threading
+
+# --- Configurações ---
+CONFIG_PATH = Path(__file__).parent.parent / "configs" / "settings.json"
+LOGS_DIR = Path.cwd() / "logs"
+BACKUP_DIR = Path.cwd() / "backup"
+DEFAULT_CONFIG = {
+    "last_dir": "",
+    "delete_zero_bytes": False,
+    "delete_useless_files": False,
+    "theme": "System"
+}
+CRITICAL_DIRS = [Path(p).resolve() for p in ["C:\\Windows", "C:\\Program Files", str(Path.home())]]
+
+USELESS_EXTENSIONS = {".log", ".ds_store", "thumbs.db", ".tmp", ".bak", ".old"}
+USELESS_DIRS = {".git", ".svn"}
+
+# Arquivos e pastas protegidas típicas do OneDrive, Google Drive, Dropbox etc.
+PROTECTED_NAMES = {
+    ".ini", "desktop.ini", "thumbs.db", "~lock", ".sync"
+}
+
+def listar_top_processos(n=10):
+    processos = []
+    for p in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_info']):
+        try:
+            processos.append({
+                "pid": p.info['pid'],
+                "nome": p.info['name'],
+                "cpu": p.info['cpu_percent'],
+                "mem": p.info['memory_info'].rss / (1024 * 1024)  # MB
+            })
+        except Exception:
+            pass
+    return sorted(processos, key=lambda x: (x['cpu'], x['mem']), reverse=True)[:n]
+
+# --- Funções ---
+def load_config():
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return DEFAULT_CONFIG.copy()
+
+def save_config(cfg):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=4)
+
+def is_path_critical(path: Path):
+    try:
+        path = path.resolve()
+        for crit in CRITICAL_DIRS:
+            if crit in path.parents or path == crit:
+                return True
+        return False
+    except Exception:
+        return True  # bloquear se erro
+
+def is_protected_dir(path: Path):
+    # Detecta se caminho está em pastas protegidas da nuvem
+    if any(part in PROTECTED_DIR_NAMES for part in path.parts):
+        return True
+    return False
+
+def listar_pastas(diretorio, delete_zero, delete_useless):
+    vazias = []
+    diretorio = Path(diretorio)
+    for root, dirs, files in os.walk(diretorio):
+        root_path = Path(root)
+        # Bloquear exclusão dentro de pastas protegidas da nuvem
+        if is_protected_dir(root_path):
+            continue
+
+        # Ignorar diretórios inúteis (ex: .git)
+        if any(ud in root_path.parts for ud in USELESS_DIRS):
+            continue
+
+        # Bloquear exclusão se houver arquivos protegidos
+        tem_protegidos = any(
+            any(prot_name.lower() in f.lower() for prot_name in PROTECTED_NAMES)
+            for f in files
+        )
+        if tem_protegidos:
+            continue  # pula esta pasta
+
+        vazio = (len(dirs) == 0) and (len(files) == 0)
+
+        if delete_useless and files:
+            useless_files = [f for f in files if Path(f).suffix.lower() in USELESS_EXTENSIONS]
+            # Só excluir se TODOS os arquivos forem inúteis
+            vazio = vazio or (len(files) == len(useless_files))
+
+        if delete_zero and files:
+            try:
+                tem_zero_byte = any((root_path / f).stat().st_size == 0 for f in files)
+                vazio = vazio or tem_zero_byte
+            except Exception:
+                pass
+
+        if vazio:
+            vazias.append(str(root_path))
+    return sorted(set(vazias), reverse=True)
+
+def backup_pasta(pasta: Path):
+    backup_path = BACKUP_DIR / pasta.name
+    if backup_path.exists():
+        backup_path = BACKUP_DIR / (pasta.name + "_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+    shutil.copytree(pasta, backup_path)
+    return backup_path
+
+def excluir_selecionadas(lista, simulate):
+    excluidas = []
+    erros = []
+    BACKUP_DIR.mkdir(exist_ok=True)
+    for caminho_str in lista:
+        caminho = Path(caminho_str)
+        try:
+            if simulate:
+                excluidas.append(caminho_str)
+                continue
+            # Backup antes de excluir
+            backup_pasta(caminho)
+            shutil.rmtree(caminho, ignore_errors=False)
+            if not caminho.exists():
+                excluidas.append(caminho_str)
+        except Exception as e:
+            erros.append(f"{caminho_str} -> {e}")
+    return excluidas, erros
+
+# --- Interface ---
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Av Cleaner")
+        self.geometry("800x650")
+        self.resizable(False, False)
+
+        self.cfg = load_config()
+        ctk.set_appearance_mode(self.cfg.get("theme", "System"))
+        ctk.set_default_color_theme("dark-blue")
+
+        self.dir = ctk.StringVar(value=self.cfg.get("last_dir", ""))
+        self.chk_zero = ctk.BooleanVar(value=self.cfg.get("delete_zero_bytes", False))
+        self.chk_useless = ctk.BooleanVar(value=self.cfg.get("delete_useless_files", False))
+
+        self.create_widgets()
+
+    def create_widgets(self):
+        tabview = ctk.CTkTabview(self)
+        tabview.pack(expand=True, fill="both", padx=15, pady=15)
+
+        # Aba Limpeza
+        self.tab_clean = tabview.add("Limpeza")
+        self.create_clean_tab()
+
+        # Aba Processos
+        self.tab_process = tabview.add("Processos")
+        self.create_process_tab()
+
+        # Aba Logs
+        self.tab_logs = tabview.add("Logs")
+        self.create_logs_tab()
+
+    def create_clean_tab(self):
+        frame = self.tab_clean
+
+        ctk.CTkLabel(frame, text="Selecione o diretório:").pack(pady=(10,5), anchor="w")
+        dir_frame = ctk.CTkFrame(frame)
+        dir_frame.pack(fill="x", padx=5)
+
+        ctk.CTkEntry(dir_frame, textvariable=self.dir, width=580).pack(side="left", padx=(5,2), pady=5)
+        ctk.CTkButton(dir_frame, text="Procurar…", width=100, command=self.select_dir).pack(side="left", padx=2, pady=5)
+
+        opts_frame = ctk.CTkFrame(frame)
+        opts_frame.pack(pady=10, padx=5, fill="x")
+        ctk.CTkCheckBox(opts_frame, text="Excluir arquivos de 0 bytes", variable=self.chk_zero).pack(anchor="w", padx=5, pady=2)
+        ctk.CTkCheckBox(opts_frame, text="Excluir arquivos inúteis (.log, .tmp, .bak, etc)", variable=self.chk_useless).pack(anchor="w", padx=5, pady=2)
+
+        theme_frame = ctk.CTkFrame(frame)
+        theme_frame.pack(pady=5, fill="x", padx=5)
+        ctk.CTkLabel(theme_frame, text="Tema:").pack(side="left", padx=5)
+        themes = ["Dark", "Light", "System"]
+        self.theme_var = ctk.StringVar(value=self.cfg.get("theme", "System"))
+        theme_menu = ctk.CTkOptionMenu(theme_frame, values=themes, variable=self.theme_var, command=self.change_theme)
+        theme_menu.pack(side="left")
+
+        btns_frame = ctk.CTkFrame(frame)
+        btns_frame.pack(pady=10, fill="x", padx=5)
+
+        self.btn_preview = ctk.CTkButton(btns_frame, text="Pré-Visualizar", command=self.do_preview)
+        self.btn_preview.pack(side="left", padx=5)
+        self.btn_simulate = ctk.CTkButton(btns_frame, text="Simular Exclusão", fg_color="#FFA500", hover_color="#FFB833", command=self.do_simulate)
+        self.btn_simulate.pack(side="left", padx=5)
+        self.btn_execute = ctk.CTkButton(btns_frame, text="Executar Exclusão", fg_color="#D9534F", hover_color="#E74C3C", command=self.do_execute)
+        self.btn_execute.pack(side="left", padx=5)
+
+        listbox_frame = ctk.CTkFrame(frame)
+        listbox_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        self.listbox = tk.Listbox(listbox_frame, selectmode="extended", width=100, height=15)
+        self.listbox.pack(side="left", fill="both", expand=True)
+
+        scrollbar = tk.Scrollbar(listbox_frame, command=self.listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.listbox.config(yscrollcommand=scrollbar.set)
+
+        btns_select_frame = ctk.CTkFrame(frame)
+        btns_select_frame.pack(fill="x", padx=5)
+
+        self.btn_select_all = ctk.CTkButton(btns_select_frame, text="Selecionar Tudo", command=self.select_all)
+        self.btn_select_all.pack(side="left", padx=5, pady=5)
+        self.btn_clear_sel = ctk.CTkButton(btns_select_frame, text="Desmarcar Tudo", command=self.clear_selection)
+        self.btn_clear_sel.pack(side="left", padx=5, pady=5)
+
+        self.status_label = ctk.CTkLabel(frame, text="", anchor="w", fg_color="#222222")
+        self.status_label.pack(fill="x", padx=5, pady=5)
+
+    def create_process_tab(self):
+        frame = self.tab_process
+
+        cols = ("PID", "Nome", "CPU (%)", "Memória (MB)")
+        self.tree = ttk.Treeview(frame, columns=cols, show="headings", height=20)
+        for col in cols:
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=150, anchor="center")
+        self.tree.pack(fill="both", expand=True, padx=5, pady=5)
+
+        btns_frame = ctk.CTkFrame(frame)
+        btns_frame.pack(pady=5)
+        self.btn_refresh_procs = ctk.CTkButton(btns_frame, text="Atualizar", command=self.update_process_list)
+        self.btn_refresh_procs.pack(side="left", padx=5)
+
+        self.btn_kill_proc = ctk.CTkButton(btns_frame, text="Finalizar Processo Selecionado", fg_color="#D9534F", hover_color="#E74C3C", command=self.kill_selected_process)
+        self.btn_kill_proc.pack(side="left", padx=5)
+
+        self.update_process_list()
+
+    def create_logs_tab(self):
+        frame = self.tab_logs
+
+        self.logs_listbox = tk.Listbox(frame, width=100, height=25)
+        self.logs_listbox.pack(side="left", fill="both", expand=True, padx=5, pady=5)
+        self.logs_listbox.bind("<Double-Button-1>", self.open_log_file)
+
+        scrollbar = tk.Scrollbar(frame, command=self.logs_listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.logs_listbox.config(yscrollcommand=scrollbar.set)
+
+        btns_frame = ctk.CTkFrame(frame)
+        btns_frame.pack(pady=5)
+        self.btn_refresh_logs = ctk.CTkButton(btns_frame, text="Atualizar Logs", command=self.load_logs)
+        self.btn_refresh_logs.pack()
+
+        self.load_logs()
+
+    # Ações
+    def select_dir(self):
+        d = filedialog.askdirectory()
+        if d:
+            self.dir.set(d)
+
+    def select_all(self):
+        self.listbox.select_set(0, tk.END)
+
+    def clear_selection(self):
+        self.listbox.selection_clear(0, tk.END)
+
+    def change_theme(self, selected):
+        ctk.set_appearance_mode(selected)
+        self.cfg["theme"] = selected
+        save_config(self.cfg)
+
+    def do_preview(self):
+        d = self.dir.get()
+        if not d:
+            messagebox.showwarning("Atenção", "Selecione um diretório válido.")
+            return
+        if is_path_critical(Path(d)):
+            messagebox.showwarning("Atenção", "Diretório crítico detectado! Operação bloqueada.")
+            return
+        if is_protected_dir(Path(d)):
+            messagebox.showwarning(
+                "Diretório Protegido",
+                "O diretório selecionado está vinculado a serviços de nuvem como OneDrive/Google Drive.\n"
+                "A exclusão pode causar perda de dados importantes.\n"
+                "Operação abortada."
+            )
+            return
+        self._update_cfg()
+        self.status_label.configure(text="Carregando pastas vazias...")
+        self.listbox.delete(0, tk.END)
+
+        def tarefa():
+            itens = listar_pastas(d, self.chk_zero.get(), self.chk_useless.get())
+            self.listbox.delete(0, tk.END)
+            for p in itens:
+                self.listbox.insert(tk.END, p)
+            self.status_label.configure(text=f"{len(itens)} pastas listadas para possível exclusão.")
+
+        threading.Thread(target=tarefa, daemon=True).start()
+
+    def do_simulate(self):
+        self._excluir(simulate=True)
+
+    def do_execute(self):
+        self._excluir(simulate=False)
+
+    def _excluir(self, simulate):
+        sel = [self.listbox.get(i) for i in self.listbox.curselection()]
+        if not sel:
+            messagebox.showinfo("Nada selecionado", "Selecione pastas para excluir!")
+            return
+        op = "Simulação" if simulate else "Exclusão"
+        if not messagebox.askyesno("Confirmação", f"{op} de {len(sel)} pastas. Deseja continuar?"):
+            return
+        self._update_cfg()
+        self.status_label.configure(text=f"{op} em andamento... Aguarde.")
+        self._disable_buttons(True)
+
+        def tarefa():
+            excluidas, erros = excluir_selecionadas(sel, simulate)
+            logpath = self.log_results(sel, excluidas, erros)
+            self.status_label.configure(text=f"{len(excluidas)} pastas {('simuladas' if simulate else 'excluídas')}. Logs em: {logpath}")
+            self.do_preview()
+            self._disable_buttons(False)
+            if erros:
+                messagebox.showwarning("Erros na exclusão", "\n".join(erros))
+            else:
+                messagebox.showinfo("Concluído", f"{len(excluidas)} pastas {('simuladas' if simulate else 'excluídas')} com sucesso.")
+
+        threading.Thread(target=tarefa, daemon=True).start()
+
+    def _disable_buttons(self, disable):
+        state = "disabled" if disable else "normal"
+        self.btn_preview.configure(state=state)
+        self.btn_simulate.configure(state=state)
+        self.btn_execute.configure(state=state)
+        self.btn_select_all.configure(state=state)
+        self.btn_clear_sel.configure(state=state)
+
+    def _update_cfg(self):
+        self.cfg.update({
+            "last_dir": self.dir.get(),
+            "delete_zero_bytes": self.chk_zero.get(),
+            "delete_useless_files": self.chk_useless.get()
+        })
+        save_config(self.cfg)
+
+    def log_results(self, allsel, excluidas, erros):
+        LOGS_DIR.mkdir(exist_ok=True)
+        fname = datetime.now().strftime("log_%Y%m%d_%H%M%S.txt")
+        path = LOGS_DIR / fname
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"Av Cleaner\n")
+            f.write(f"Data: {datetime.now()}\n")
+            f.write(f"Diretório: {self.dir.get()}\n")
+            f.write(f"Config: zero={self.chk_zero.get()}, useless={self.chk_useless.get()}\n")
+            f.write("Selecionadas:\n")
+            for p in allsel:
+                f.write(p + "\n")
+            f.write("Excluídas:\n")
+            for p in excluidas:
+                f.write(p + "\n")
+            if erros:
+                f.write("\nErros:\n")
+                for e in erros:
+                    f.write(e + "\n")
+        return path
+
+    def update_process_list(self):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        processos = listar_top_processos(20)
+        for p in processos:
+            self.tree.insert("", "end", values=(p["pid"], p["nome"], p["cpu"], f"{p['mem']:.2f}"))
+
+    def kill_selected_process(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Nenhum processo", "Selecione um processo para finalizar.")
+            return
+        pid = self.tree.item(sel[0])['values'][0]
+        try:
+            p = psutil.Process(pid)
+            nome = p.name()
+            if messagebox.askyesno("Confirmar", f"Finalizar processo '{nome}' (PID {pid})?"):
+                p.terminate()
+                p.wait(timeout=5) # Aguarda até 5 segundos para finalizar
+                messagebox.showinfo("Sucesso", f"Processo '{nome}' (PID {pid}) finalizado com sucesso.")        
+                self.update_process_list()
+        except Exception as e: 
+            messagebox.showerror("Erro", f"Não foi possível finalizar o processo: {e}")
+    def load_logs(self):
+        self.logs_listbox.delete(0, tk.END)
+        if not LOGS_DIR.exists():
+            return
+        files = sorted(LOGS_DIR.glob("log_*.txt"), reverse=True)
+        for f in files:
+            self.logs_listbox.insert(tk.END, str(f.name))
+
+    def open_log_file(self, event):
+        sel = self.logs_listbox.curselection()
+        if not sel:
+            return
+        fname = self.logs_listbox.get(sel[0])
+        path = LOGS_DIR / fname
+        try:
+            os.startfile(path)
+        except Exception as e:
+            messagebox.showerror("Erro", f"Não foi possível abrir o arquivo de log: {e}")
+
+if __name__ == "__main__":
+    # Garante que as pastas e arquivos de configuração existam
+    try:
+        if not CONFIG_PATH.exists():
+            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(CONFIG_PATH, "w") as f:
+                json.dump(DEFAULT_CONFIG, f, indent=4)
+        BACKUP_DIR.mkdir(exist_ok=True)
+        LOGS_DIR.mkdir(exist_ok=True)
+    except Exception as e:
+        messagebox.showerror("Erro", f"Falha ao preparar ambiente: {e}")
+    App().mainloop()
